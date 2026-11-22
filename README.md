@@ -36,14 +36,30 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/ -q
+python -m pytest tests/ -q          # 引擎 + 接口
+node --test tests/frontend.test.mjs # 首屏/展开、换表与过期明细（Node 18+，无需浏览器）
 ```
 
 ## 页面与接口
 
+值班员先看**首屏结论**再按需展开：
+
+1. 首屏汇总：故障轮次数、首呼受影响轮数（推迟/压掉/提前/新增）、两套规则下首呼数量、截止时仍在等待的轮数；
+2. 逐轮结论表：两套规则下的首呼时刻、随呼发出的未静默活动告警、截止时等待状态，受影响轮次排在前面；
+3. 展开某轮才向服务端补算该轮在两套规则下的完整未静默活动区间；浏览器只传 `simulation_id` + 服务/轮次，不重传告警。
+
+换表规则：**新预演成功才换表**；等待或失败期间旧表仍可展开区间，失败时在页面顶部说明原因。
+换表后到达的旧明细按 `simulation_id`/generation 直接丢弃，不写入新表。
+
 - `GET /`：预演页（告警导入、两套静默规则、等待时长、观察截止、逐轮对照表）
-- `POST /api/simulate`：请求体同页面结构，返回汇总计数与逐轮对照（含每段未静默活动区间，便于核对计时过程）
+- `POST /api/simulate`：默认返回**完整结果**（含每段未静默活动区间）；请求加 `"summary_only": true`
+  时只返回首屏结论与扫描统计（不含区间），页面使用这一模式
+- `POST /api/round-details`：展开某轮时补算完整未静默区间，请求
+  `{"simulation_id", "service", "round_index"}`，复用该次预演留存的输入
 - `GET /api/sample`：返回内置样例载荷
+
+`/api/simulate` 响应中的 `simulation_id` 用于展开明细（服务端保留最近 32 次预演输入；
+服务重启或结果被淘汰后展开会返回 404，页面提示重新预演）。
 
 请求字段：
 
@@ -54,6 +70,12 @@ python -m pytest tests/ -q
 | `proposed_silences[]` | 拟新增规则，结构同上 |
 | `wait_minutes` | 首呼等待时长（分钟，>0） |
 | `cutoff_at` | 观察截止时间 |
+| `summary_only` | 可选，默认 `false`；`true` 时省去未静默区间 |
+
+**首屏扫描提前结束**：逐轮、逐条规则各自定首呼——按事件时点推进“连续未静默”段，
+段内凑满等待时长即得出结论并立即停止，不再检查该轮此后的告警触发/恢复与静默生效/解除。
+未首呼的轮次才需要扫满。每条结论带 `scan.events_scanned / events_total`，页面直接标注
+“检查 x/y 个时点后首呼已确定”。该结论与完整区间推导逐项一致（引擎随机用例对拍）。
 
 时间统一用 ISO-8601，推荐带 `Z`（如 `2026-11-21T10:00:00Z`）；不带时区的时间按 UTC 处理。
 截止之后才触发的告警会被忽略并在响应中列出。
@@ -76,10 +98,11 @@ python -m pytest tests/ -q
 
 ```
 app/
-  engine.py          # 纯逻辑：轮次构建、未静默区间切分、首呼判定、两套对照
-  main.py            # FastAPI 路由与入参校验
+  engine.py          # 纯逻辑：轮次构建、首屏提前结束扫描、未静默区间、首呼判定、两套对照
+  main.py            # FastAPI 路由、入参校验、预演输入留存与展开明细
   sample.py          # 内置样例
-  static/index.html  # 预演页（原生 JS，无构建步骤）
-tests/               # 引擎与接口自测（30 个用例）
+  static/index.html  # 预演页骨架（原生 ESM，无构建步骤）
+  static/app.mjs     # 首屏/展开渲染与换表所有权逻辑（可在 Node 中单测）
+tests/               # 引擎与接口自测 + 前端纯逻辑自测
 Dockerfile / docker-compose.yml / requirements.txt
 ```

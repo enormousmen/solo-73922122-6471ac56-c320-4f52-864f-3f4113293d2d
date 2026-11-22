@@ -114,6 +114,21 @@ class RoundResult:
     still_waiting_at_cutoff: bool  # 截止时仍在等待（未首呼的原因之一）
 
 
+@dataclass
+class CallScan:
+    """只有首屏结论的扫描结果（不保留未静默区间）。
+
+    ``events_scanned`` 记录实际检查过状态的时点数；一旦首呼确定就停止，
+    因此可能小于 ``events_total``（该轮全部告警/规则事件时点数）。
+    """
+
+    first_call_at: Optional[datetime]
+    called_alert_ids: list[str]
+    still_waiting_at_cutoff: bool
+    events_total: int
+    events_scanned: int
+
+
 # --------------------------------------------------------------------------- #
 # 轮次构建：纯告警驱动，与静默规则无关（两轮模拟共用同一套轮次）
 # --------------------------------------------------------------------------- #
@@ -168,14 +183,28 @@ def current_horizon(round_: Round) -> datetime:
 # --------------------------------------------------------------------------- #
 
 
-def unsilenced_stretches(
-    round_: Round, rules: list[SilenceRule], cutoff: datetime
-) -> list[Stretch]:
-    """把轮次投影到时间轴，切出“存在未静默活动告警”的连续区间。
+def rules_for_round(round_: Round, rules: list[SilenceRule]) -> list[SilenceRule]:
+    """只保留能命中本轮回告警的规则。
 
-    同刻事件先全部生效再判定：以事件时刻 t 的状态描述区间 [t, next_t)，
-    因此触发、恢复、静默生效/解除落在同一时刻时自动合并处理。
+    规则是否命中只看标签，与时间无关；命中不了任何一条告警的规则永远不会改变
+    本轮“存在未静默活动告警”的状态，它的起止时刻也就不必作为事件时点参与切分。
+    这是首屏提前结束扫描之外的又一处纯等价剪枝。
     """
+    return [rule for rule in rules if any(rule.matches(a) for a in round_.alerts)]
+
+
+def _active_unsilenced(
+    round_: Round, rules: list[SilenceRule], t: datetime
+) -> list[Alert]:
+    return [
+        a for a in round_.alerts if a.active_at(t) and not a.silenced_at(t, rules)
+    ]
+
+
+def _event_times(
+    round_: Round, rules: list[SilenceRule], cutoff: datetime
+) -> list[datetime]:
+    """轮次内可能改变“未静默活动状态”的全部时点（严格早于截止）。"""
     times: set[datetime] = {round_.started_at}
     for a in round_.alerts:
         if a.fired_at < cutoff:
@@ -187,7 +216,19 @@ def unsilenced_stretches(
             times.add(rule.start_at)
         if rule.end_at < cutoff:
             times.add(rule.end_at)
-    event_times = sorted(t for t in times if t < cutoff)
+    return sorted(t for t in times if t < cutoff)
+
+
+def unsilenced_stretches(
+    round_: Round, rules: list[SilenceRule], cutoff: datetime
+) -> list[Stretch]:
+    """把轮次投影到时间轴，切出“存在未静默活动告警”的连续区间。
+
+    同刻事件先全部生效再判定：以事件时刻 t 的状态描述区间 [t, next_t)，
+    因此触发、恢复、静默生效/解除落在同一时刻时自动合并处理。
+    """
+    rules = rules_for_round(round_, rules)
+    event_times = _event_times(round_, rules, cutoff)
     if not event_times:
         return []
 
@@ -195,11 +236,7 @@ def unsilenced_stretches(
     seg_start: Optional[datetime] = None
 
     def active_unsilenced(t: datetime) -> list[Alert]:
-        return [
-            a
-            for a in round_.alerts
-            if a.active_at(t) and not a.silenced_at(t, rules)
-        ]
+        return _active_unsilenced(round_, rules, t)
 
     for i, t in enumerate(event_times):
         present = active_unsilenced(t)
@@ -229,30 +266,86 @@ def unsilenced_stretches(
 # --------------------------------------------------------------------------- #
 
 
+def scan_round(
+    round_: Round,
+    rules: list[SilenceRule],
+    wait: timedelta,
+    cutoff: datetime,
+) -> CallScan:
+    """只为首屏求首呼结论，边扫描边判定，首呼一旦确定立即停止。
+
+    与 :func:`simulate_round` 的结论完全一致，但不构建 ``Stretch`` 列表：
+    按事件时点推进“连续未静默”段，段内凑满等待时长即给出首呼；确定后
+    直接返回，不再检查该轮此后的任何事件时点（后面的告警触发/恢复、静默
+    生效/解除都无法再改变“每轮只首呼一次”的结论）。
+    """
+    rules = rules_for_round(round_, rules)
+    event_times = _event_times(round_, rules, cutoff)
+    events_total = len(event_times)
+
+    def hit(candidate: datetime, scanned: int) -> CallScan:
+        return CallScan(
+            first_call_at=candidate,
+            called_alert_ids=[
+                a.id for a in _active_unsilenced(round_, rules, candidate)
+            ],
+            still_waiting_at_cutoff=False,
+            events_total=events_total,
+            events_scanned=scanned,
+        )
+
+    seg_start: Optional[datetime] = None
+    for i, t in enumerate(event_times):
+        if seg_start is not None:
+            candidate = seg_start + wait
+            # 凑满等待的时刻早于下一个事件时点：无需再看 t 的状态，直接首呼。
+            if candidate < cutoff and candidate < t:
+                return hit(candidate, scanned=i)
+        # 到此处必须检查 t 时刻的状态：第 i+1 个时点已扫描
+        present = bool(_active_unsilenced(round_, rules, t))
+        if seg_start is not None:
+            candidate = seg_start + wait
+            # 恰好在 t 凑满：仅当 t 时刻仍未静默才成立（同刻静默生效不算）
+            if candidate < cutoff and candidate == t and present:
+                return hit(candidate, scanned=i + 1)
+            if not present:
+                seg_start = None
+        if present and seg_start is None:
+            seg_start = t
+
+    if seg_start is not None:
+        candidate = seg_start + wait
+        # 最后一段一直延续到观察截止：截止前凑满则首呼（开口段）
+        if candidate < cutoff:
+            return hit(candidate, scanned=events_total)
+
+    return CallScan(
+        first_call_at=None,
+        called_alert_ids=[],
+        # 只有“最后一个时点起一直未静默到截止”才算仍在等待；静默恰好在截止
+        # 点解除时，未静默状态是截止点才出现的，尚未开始等待。
+        still_waiting_at_cutoff=bool(
+            seg_start is not None and _active_unsilenced(round_, rules, cutoff)
+        ),
+        events_total=events_total,
+        events_scanned=events_total,
+    )
+
+
 def simulate_round(
     round_: Round,
     rules: list[SilenceRule],
     wait: timedelta,
     cutoff: datetime,
 ) -> RoundResult:
+    """完整结果：先切出全部未静默区间，再由区间推导首呼结论。"""
     stretches = unsilenced_stretches(round_, rules, cutoff)
-    first_call_at: Optional[datetime] = None
-    called_alerts: list[Alert] = []
-
-    for stretch in stretches:
-        candidate = stretch.start + wait
-        # 必须在本段内满足等待；观察截止时刻本身不再判定首呼
-        if candidate < cutoff and (
-            stretch.open_ended or candidate < stretch.end
-        ):
-            first_call_at = candidate
-            called_alerts = [
-                a
-                for a in round_.alerts
-                if a.active_at(candidate) and not a.silenced_at(candidate, rules)
-            ]
-            break  # 每轮故障至多首呼一次
-
+    first_call_at = _first_call_from(stretches, wait, cutoff)
+    called_alerts = (
+        _active_unsilenced(round_, rules_for_round(round_, rules), first_call_at)
+        if first_call_at is not None
+        else []
+    )
     waiting = (
         first_call_at is None
         and bool(stretches)
@@ -269,6 +362,17 @@ def simulate_round(
         called_alert_ids=[a.id for a in called_alerts],
         still_waiting_at_cutoff=waiting,
     )
+
+
+def _first_call_from(
+    stretches: list[Stretch], wait: timedelta, cutoff: datetime
+) -> Optional[datetime]:
+    for stretch in stretches:
+        candidate = stretch.start + wait
+        # 必须在本段内满足等待；观察截止时刻本身不再判定首呼
+        if candidate < cutoff and (stretch.open_ended or candidate < stretch.end):
+            return candidate
+    return None
 
 
 def simulate(
@@ -292,23 +396,6 @@ def compare(
     rows: list[dict] = []
     for b, a in zip(before, after):
         assert (b.service, b.round_index) == (a.service, a.round_index)
-        if b.first_call_at is None and a.first_call_at is None:
-            verdict = "still_not_called"
-        elif b.first_call_at is not None and a.first_call_at is None:
-            verdict = "suppressed"
-        elif b.first_call_at is None and a.first_call_at is not None:
-            verdict = "newly_called"
-        elif a.first_call_at > b.first_call_at:
-            verdict = "delayed"
-        elif a.first_call_at < b.first_call_at:
-            verdict = "earlier"
-        else:
-            verdict = "unchanged"
-
-        delay = None
-        if b.first_call_at is not None and a.first_call_at is not None:
-            delay = int((a.first_call_at - b.first_call_at).total_seconds())
-
         rows.append(
             {
                 "service": b.service,
@@ -316,13 +403,90 @@ def compare(
                 "started_at": dt_iso(b.started_at),
                 "ended_at": dt_iso(b.ended_at),
                 "alert_ids": b.alert_ids,
-                "verdict": verdict,
-                "delay_seconds": delay,
+                "verdict": _verdict(b.first_call_at, a.first_call_at),
+                "delay_seconds": _delay(b.first_call_at, a.first_call_at),
                 "before": _result_payload(b),
                 "after": _result_payload(a),
             }
         )
     return rows
+
+
+def _verdict(
+    before_at: Optional[datetime], after_at: Optional[datetime]
+) -> str:
+    if before_at is None and after_at is None:
+        return "still_not_called"
+    if before_at is not None and after_at is None:
+        return "suppressed"
+    if before_at is None and after_at is not None:
+        return "newly_called"
+    assert before_at is not None and after_at is not None
+    if after_at > before_at:
+        return "delayed"
+    if after_at < before_at:
+        return "earlier"
+    return "unchanged"
+
+
+def _delay(
+    before_at: Optional[datetime], after_at: Optional[datetime]
+) -> Optional[int]:
+    if before_at is None or after_at is None:
+        return None
+    return int((after_at - before_at).total_seconds())
+
+
+# --------------------------------------------------------------------------- #
+# 首屏扫描：只求结论，不保留区间
+# --------------------------------------------------------------------------- #
+
+
+def scan_rounds(
+    rounds: list[Round],
+    current_rules: list[SilenceRule],
+    proposed_rules: list[SilenceRule],
+    wait: timedelta,
+    cutoff: datetime,
+) -> list[dict]:
+    """逐轮分别扫描两套规则，输出首屏所需结论（无未静默区间）。"""
+    rows: list[dict] = []
+    for round_ in rounds:
+        before = scan_round(round_, current_rules, wait, cutoff)
+        after = scan_round(
+            round_, current_rules + proposed_rules, wait, cutoff
+        )
+        rows.append(
+            {
+                "service": round_.service,
+                "round_index": round_.round_index,
+                "started_at": dt_iso(round_.started_at),
+                "ended_at": dt_iso(round_.ended_at),
+                "alert_ids": [a.id for a in round_.alerts],
+                "verdict": _verdict(
+                    before.first_call_at, after.first_call_at
+                ),
+                "delay_seconds": _delay(
+                    before.first_call_at, after.first_call_at
+                ),
+                "before": _scan_payload(before),
+                "after": _scan_payload(after),
+            }
+        )
+    return rows
+
+
+def _scan_payload(scan: CallScan) -> dict:
+    return {
+        "first_call_at": dt_iso(scan.first_call_at),
+        "called_alert_ids": scan.called_alert_ids,
+        "still_waiting_at_cutoff": scan.still_waiting_at_cutoff,
+        "scan": {
+            "events_total": scan.events_total,
+            "events_scanned": scan.events_scanned,
+            "stopped_early": scan.events_scanned < scan.events_total,
+        },
+    }
 
 
 def _result_payload(r: RoundResult) -> dict:
@@ -357,6 +521,17 @@ def summarize(rows: list[dict]) -> dict:
         "earlier": count("earlier"),
         "newly_called": count("newly_called"),
         "still_not_called": count("still_not_called"),
+        "affected": sum(
+            1
+            for r in rows
+            if r["verdict"] in ("delayed", "suppressed", "earlier", "newly_called")
+        ),
+        "before_waiting_at_cutoff": sum(
+            1 for r in rows if r["before"]["still_waiting_at_cutoff"]
+        ),
+        "after_waiting_at_cutoff": sum(
+            1 for r in rows if r["after"]["still_waiting_at_cutoff"]
+        ),
         "not_called_after": sum(
             1 for r in rows if r["after"]["first_call_at"] is None
         ),

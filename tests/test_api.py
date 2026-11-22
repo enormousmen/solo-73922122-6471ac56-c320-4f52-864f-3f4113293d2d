@@ -152,3 +152,132 @@ def test_bad_rule_interval_rejected():
     r = client.post("/api/simulate", json=payload)
     assert r.status_code == 422
     assert "终点必须晚于起点" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 首屏 summary_only / 展开明细
+# --------------------------------------------------------------------------- #
+
+
+def test_default_simulate_still_returns_full_result():
+    r = client.post("/api/simulate", json=SAMPLE_PAYLOAD)
+    data = r.json()
+    assert data["summary_only"] is False
+    assert data["simulation_id"]
+    for row in data["rounds"]:
+        for side in ("before", "after"):
+            assert "unsilenced_stretches" in row[side]
+            assert "scan" not in row[side]
+    # 完整结果与旧行为一致
+    assert data["summary"]["total_rounds"] == 7
+
+
+def test_summary_only_omits_stretches_but_keeps_conclusions():
+    full = client.post("/api/simulate", json=SAMPLE_PAYLOAD).json()
+    brief = client.post(
+        "/api/simulate", json={**SAMPLE_PAYLOAD, "summary_only": True}
+    ).json()
+
+    assert brief["summary_only"] is True
+    assert brief["summary"] == full["summary"]
+    assert [(r["service"], r["round_index"], r["verdict"], r["delay_seconds"])
+            for r in brief["rounds"]] == [
+        (r["service"], r["round_index"], r["verdict"], r["delay_seconds"])
+        for r in full["rounds"]
+    ]
+    for b, f in zip(brief["rounds"], full["rounds"]):
+        for side in ("before", "after"):
+            assert b[side]["first_call_at"] == f[side]["first_call_at"]
+            assert b[side]["called_alert_ids"] == f[side]["called_alert_ids"]
+            assert b[side]["still_waiting_at_cutoff"] == f[side]["still_waiting_at_cutoff"]
+            assert "unsilenced_stretches" not in b[side]
+            assert "scan" in b[side]
+
+
+def test_summary_only_reports_early_stop():
+    brief = client.post(
+        "/api/simulate", json={**SAMPLE_PAYLOAD, "summary_only": True}
+    ).json()
+    by_key = {(r["service"], r["round_index"]): r for r in brief["rounds"]}
+    # payment-api 两套规则都在首呼确定后停止
+    pay = by_key[("payment-api", 1)]
+    assert pay["before"]["scan"]["stopped_early"] is True
+    assert pay["after"]["scan"]["stopped_early"] is True
+    assert pay["after"]["scan"]["events_scanned"] < pay["after"]["scan"]["events_total"]
+    # 截止时仍在等待的 auth#1，加静默后必须扫满才能确认
+    auth = by_key[("auth", 1)]
+    assert auth["after"]["still_waiting_at_cutoff"] is True
+    assert auth["after"]["scan"]["stopped_early"] is False
+
+
+def test_round_details_uses_stored_inputs():
+    brief = client.post(
+        "/api/simulate", json={**SAMPLE_PAYLOAD, "summary_only": True}
+    ).json()
+    sim_id = brief["simulation_id"]
+    r = client.post(
+        "/api/round-details",
+        json={"simulation_id": sim_id, "service": "payment-api", "round_index": 1},
+    )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["before"]["unsilenced_stretches"] == [
+        {"start": "2026-11-21T10:00:00Z", "end": "2026-11-21T10:40:00Z", "open_ended": False}
+    ]
+    assert d["after"]["unsilenced_stretches"] == [
+        {"start": "2026-11-21T10:00:00Z", "end": "2026-11-21T10:05:00Z", "open_ended": False},
+        {"start": "2026-11-21T10:10:00Z", "end": "2026-11-21T10:40:00Z", "open_ended": False},
+    ]
+    # 展开明细与完整模拟的区间完全一致（同一套输入）
+    full = client.post("/api/simulate", json=SAMPLE_PAYLOAD).json()
+    full_row = next(
+        x for x in full["rounds"]
+        if (x["service"], x["round_index"]) == ("payment-api", 1)
+    )
+    assert d["before"]["unsilenced_stretches"] == full_row["before"]["unsilenced_stretches"]
+    assert d["after"]["unsilenced_stretches"] == full_row["after"]["unsilenced_stretches"]
+
+
+def test_round_details_rejects_unknown_simulation_and_round():
+    brief = client.post(
+        "/api/simulate", json={**SAMPLE_PAYLOAD, "summary_only": True}
+    ).json()
+    r = client.post(
+        "/api/round-details",
+        json={"simulation_id": "nope", "service": "payment-api", "round_index": 1},
+    )
+    assert r.status_code == 404
+    assert "重新运行预演" in r.json()["detail"]
+
+    r = client.post(
+        "/api/round-details",
+        json={
+            "simulation_id": brief["simulation_id"],
+            "service": "payment-api",
+            "round_index": 9,
+        },
+    )
+    assert r.status_code == 404
+    assert "不属于这次预演" in r.json()["detail"]
+
+
+def test_each_simulation_gets_its_own_id_and_inputs():
+    a = client.post("/api/simulate", json=SAMPLE_PAYLOAD).json()
+    payload_b = {
+        **SAMPLE_PAYLOAD,
+        "wait_minutes": 30,
+    }
+    b = client.post("/api/simulate", json={**payload_b, "summary_only": True}).json()
+    assert a["simulation_id"] != b["simulation_id"]
+
+    # 用 B 的 id 展开，必须按 B 的等待时长（30 分钟）计算，而不是 A 的 10 分钟
+    d = client.post(
+        "/api/round-details",
+        json={"simulation_id": b["simulation_id"], "service": "gateway", "round_index": 1},
+    ).json()
+    # gateway#1 未静默区间只有 11:00-11:15，30 分钟等待在区间内无法满足
+    assert d["before"]["unsilenced_stretches"] == [
+        {"start": "2026-11-21T11:00:00Z", "end": "2026-11-21T11:15:00Z", "open_ended": False}
+    ]
+    a_row = next(x for x in a["rounds"] if x["service"] == "gateway")
+    assert a_row["before"]["first_call_at"].endswith("11:10:00Z")

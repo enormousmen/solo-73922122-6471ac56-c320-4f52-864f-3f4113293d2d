@@ -2,8 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from app import engine
 
 UTC = timezone.utc
@@ -274,3 +272,96 @@ def test_half_open_interval_semantics():
     s = rule("s", {"alertname": "X"}, T(10), T(10, 20))
     assert s.covers(a, T(10, 20)) is False
     assert s.covers(a, T(10, 19, 59)) is True
+
+
+# --------------------------------------------------------------------------- #
+# 首屏提前结束扫描
+# --------------------------------------------------------------------------- #
+
+
+def test_scan_stops_once_first_call_known():
+    # A: 10:00-10:30；B: 10:10-11:00；C: 11:10-11:30（另一轮）
+    # 等待 10 分钟 => 10:10 首呼，其后 B 恢复、C 触发都与本轮结论无关
+    rounds = engine.build_rounds(
+        [
+            alert("a", "svc", T(10), T(10, 30)),
+            alert("b", "svc", T(10, 10), T(11), {"service": "svc", "alertname": "Y"}),
+            alert("c", "svc", T(11, 10), T(11, 30), {"service": "svc", "alertname": "Z"}),
+        ]
+    )
+    assert len(rounds) == 2
+    scan = engine.scan_round(rounds[0], [], W10, CUTOFF)
+    assert scan.first_call_at == T(10, 10)
+    assert scan.events_total == 4          # 10:00 / 10:10 / 10:30 / 11:00
+    assert scan.events_scanned == 2        # 首呼在 10:10 确定，其后的时点不再检查
+    full = engine.simulate_round(rounds[0], [], W10, CUTOFF)
+    assert full.first_call_at == scan.first_call_at
+    assert full.called_alert_ids == scan.called_alert_ids
+
+
+def test_scan_and_full_agree_on_waiting_state():
+    # 只活 5 分钟、短于等待：必须扫到末尾，结论为未首呼且不在等待
+    scan = engine.scan_round(engine.build_rounds([alert("a", "svc", T(10), T(10, 5))])[0], [], W10, CUTOFF)
+    assert scan.first_call_at is None
+    assert scan.still_waiting_at_cutoff is False
+    assert scan.events_scanned == scan.events_total == 2
+
+    # 截止时仍未恢复、还在等待：扫满且标记等待
+    scan = engine.scan_round(engine.build_rounds([alert("a", "svc", T(11, 50), None)])[0], [], W10, CUTOFF)
+    assert scan.first_call_at is None
+    assert scan.still_waiting_at_cutoff is True
+
+
+def test_scan_ignores_rules_that_cannot_match_round():
+    # 命不中本轮告警的规则不产生事件时点，也不能改变结论
+    rounds = engine.build_rounds([alert("a", "svc", T(10), T(10, 30))])
+    other = rule("other", {"service": "elsewhere"}, T(10), T(10, 20))
+    scan = engine.scan_round(rounds[0], [other], W10, CUTOFF)
+    assert scan.first_call_at == T(10, 10)
+    assert scan.events_total == 2          # 10:00 / 10:30，不含无关规则起止
+
+
+def test_scan_matches_full_simulation_on_random_cases():
+    import random
+
+    rng = random.Random(20261121)
+    label_pool = [
+        {"service": "svc", "alertname": "X"},
+        {"service": "svc", "alertname": "Y"},
+        {"service": "svc"},
+        {"env": "prod"},
+    ]
+    for _ in range(300):
+        alerts = []
+        for i in range(rng.randint(1, 6)):
+            fired = rng.randint(0, 115)
+            rec = rng.choice([None, fired + rng.randint(0, 70)])
+            alerts.append(
+                engine.Alert(
+                    f"a{i}",
+                    "svc",
+                    rng.choice(label_pool),
+                    T(0) + timedelta(minutes=fired),
+                    (T(0) + timedelta(minutes=min(rec, 180))) if rec is not None else None,
+                )
+            )
+        rules = []
+        for j in range(rng.randint(0, 3)):
+            start = rng.randint(0, 118)
+            rules.append(
+                engine.SilenceRule(
+                    f"s{j}",
+                    rng.choice(label_pool),
+                    T(0) + timedelta(minutes=start),
+                    T(0) + timedelta(minutes=start + rng.randint(1, 50)),
+                )
+            )
+        wait = timedelta(minutes=rng.choice([0, 1, 5, 10, 15, 30]))
+        cutoff = T(0) + timedelta(minutes=rng.choice([60, 100, 120, 150]))
+        for rd in engine.build_rounds(alerts):
+            full = engine.simulate_round(rd, rules, wait, cutoff)
+            scan = engine.scan_round(rd, rules, wait, cutoff)
+            assert scan.first_call_at == full.first_call_at
+            assert scan.called_alert_ids == full.called_alert_ids
+            assert scan.still_waiting_at_cutoff == full.still_waiting_at_cutoff
+            assert 0 <= scan.events_scanned <= scan.events_total
